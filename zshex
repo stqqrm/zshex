@@ -1,0 +1,97 @@
+# zshex.zsh - zsh wrapper for the zshex C++ binary (Ctrl-E)
+#
+# Set before sourcing (in ~/.zshrc):
+#   export ZSHEX_BIN=~/repository/zshex/zshex     # path to the binary
+#   export ZSHEX_EDITOR=vim                       # editor command (default: vim)
+#   source /path/to/zshex.zsh
+#
+# Protocol (binary stdout -> temp file):
+#   CD:<path>     directory the UI ended in (we cd there)
+#   EDIT:<path>   open this file in $ZSHEX_EDITOR, then relaunch the UI
+
+: ${ZSHEX_BIN:=zshex-bin}
+: ${ZSHEX_EDITOR:=vim}
+
+zshex-update() {
+  local url=https://raw.githubusercontent.com/stqqrm/zshex/main/zshex.cpp
+  local bin=${~ZSHEX_BIN} src hash
+  mkdir -p ${bin:h} || return
+
+  src=$(curl -fsSL $url) || return 1
+  hash=${$(print -r -- "$src" | sha256sum)[1]}
+  [[ -x $bin && -r $bin.sha256 && $(<$bin.sha256) == $hash ]] && return   # unchanged
+
+  print -r -- "$src" | g++ -std=c++17 -O2 -x c++ -o $bin.new - \
+    && mv -f $bin.new $bin \
+    && print -r -- $hash > $bin.sha256
+}
+
+# Ask sudo itself: `sudo -v` succeeds silently if credentials are cached or
+# NOPASSWD applies, prompts for your password otherwise, and fails if you are
+# not allowed to use sudo (works for "user ALL=(ALL:ALL) ALL" rules too).
+_zshex_is_sudoer() {
+  (( EUID == 0 )) && return 1
+  (( $+commands[sudo] )) || return 1
+  command sudo -v </dev/tty
+}
+
+_zshex_edit() {
+  local f=$1
+  local -a ed=(${=ZSHEX_EDITOR})
+
+  # Need elevated rights if we can't read the file, or can't write to it
+  if [[ ! -r $f || ! -w $f ]] && _zshex_is_sudoer; then
+    command sudo "${ed[@]}" -- $f </dev/tty
+  else
+    command "${ed[@]}" -- $f </dev/tty
+  fi
+}
+
+zshex-widget() {
+  local bin=${~ZSHEX_BIN}
+  if [[ $bin == */* ]]; then
+    [[ -f $bin && -x $bin ]] || { zle -M "zshex: '$bin' is not an executable file"; return }
+  else
+    (( $+commands[$bin] )) || { zle -M "zshex: '$bin' not found in PATH"; return }
+  fi
+
+  local tmp state line dir file pick rc
+  tmp=$(mktemp) || return
+  state=$(mktemp) || { command rm -f -- $tmp; return }
+
+  zle -I
+  while true; do
+    local -a args=(--state $state)
+    [[ -n $pick ]] && args+=(--select $pick)
+    pick=
+
+    command $bin $args >$tmp </dev/tty
+    rc=$?
+
+    dir= file=
+    while IFS= read -r line; do
+      case $line in
+        CD:*)   dir=${line#CD:} ;;
+        EDIT:*) file=${line#EDIT:} ;;
+      esac
+    done <$tmp
+
+    [[ -n $dir && -d $dir ]] && builtin cd -- $dir
+
+    if [[ -n $file && -e $file ]]; then
+      _zshex_edit $file
+      pick=${file:t}          # reopen with the edited file selected
+      continue
+    fi
+    break
+  done
+  command rm -f -- $tmp $state
+
+  zle reset-prompt
+  (( rc )) && zle -M "zshex: exited with status $rc"
+}
+
+zle -N zshex-widget
+bindkey '^e' zshex-widget
+bindkey -M viins '^e' zshex-widget 2>/dev/null
+bindkey -M vicmd '^e' zshex-widget 2>/dev/null
