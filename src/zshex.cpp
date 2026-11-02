@@ -275,6 +275,7 @@ struct App {
     bool done = false;         // set when a file was handed to the editor
     bool deep_mode = false;    // recursive search active: stat info is lazy
     bool scanning = false;     // recursive search still reading directories
+    int close_key = 0x05;      // --close-key N: byte that closes the UI (0 = none), default Ctrl-E
     std::string state_path;    // --state: history/memory kept across relaunches
     std::string init_select;   // --select: entry to highlight on start
     std::vector<std::string> hb, hf;             // directory history back / forward
@@ -769,7 +770,7 @@ struct App {
             draw("", false);
             int k = read_key();
             switch (k) {
-                case K_EOF: case 'q': case 0x05: case K_ESC: return;  // q, Ctrl-E, Esc
+                case K_EOF: case 'q': case K_ESC: return;  // q, Esc
                 case 'j': case K_DOWN: move(1); break;
                 case 'k': case K_UP: move(-1); break;
                 case K_PGDN: move(win); break;
@@ -796,6 +797,11 @@ struct App {
                     break;
                 case 'n': next_match(search_dir); break;
                 case 'N': next_match(-search_dir); break;
+                default:
+                    // the key that opened us also closes us (keys with a
+                    // meaning above, e.g. Ctrl-O, keep that meaning)
+                    if (close_key > 0 && k == close_key) return;
+                    break;
             }
             if (done) return;
         }
@@ -808,6 +814,7 @@ int main(int argc, char** argv) {
         std::string a = argv[i];
         if (a == "--state" && i + 1 < argc) app.state_path = argv[++i];
         else if (a == "--select" && i + 1 < argc) app.init_select = argv[++i];
+        else if (a == "--close-key" && i + 1 < argc) app.close_key = std::atoi(argv[++i]);
     }
     if (!term_raw()) {
         std::fputs("zshex-bin: cannot open /dev/tty\n", stderr);
