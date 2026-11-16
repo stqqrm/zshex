@@ -689,19 +689,47 @@ struct App {
         int s0 = sel, t0 = top;
         bool moved = false, from_walk = false;
         auto last_req = std::chrono::steady_clock::now();
+        auto last_draw = last_req;
+
+        // State of the previous filter pass, used to avoid re-checking every
+        // entry: a longer query (or the same query after the scan found more
+        // entries) can only match the previous hits plus the new entries.
+        std::string prev_q;
+        bool prev_valid = false, prev_has_terms = false;
+        size_t prev_scanned = 0;
+        long filter_ms = 0;
+
         while (true) {
             // when the list is only being refreshed because the scan found
             // more entries, keep the selection if the user has moved it
             int keep = (from_walk && moved && !idx.empty()) ? idx[sel] : -1;
             from_walk = false;
 
-            std::string lq = lower(q);
+            auto f0 = std::chrono::steady_clock::now();
+            std::string qfull = lower(q);
+            std::string lq = qfull;
             // a trailing "/" means "directories only" (the "/" shown after
             // directory names is just a marker, it is not part of the name)
             bool dirs_only = !lq.empty() && lq.back() == '/';
             if (dirs_only) lq.pop_back();
             // whitespace-separated terms: every term must match, in any order
             std::vector<std::string> terms = split_terms(lq);
+
+            // Candidates: the previous hits plus newly scanned entries when the
+            // new query is the same as, or an extension of, the previous one.
+            // Not valid if the previous query had a trailing '/' (its hits were
+            // restricted to directories) or no terms (it only listed depth 0).
+            bool narrow = prev_valid &&
+                (qfull == prev_q ||
+                 (prev_has_terms && prev_q.back() != '/' &&
+                  qfull.compare(0, prev_q.size(), prev_q) == 0));
+            std::vector<int> cand;
+            if (narrow) {
+                cand = idx;  // previous matches
+                for (size_t i = prev_scanned; i < all.size(); i++) cand.push_back(static_cast<int>(i));
+                std::sort(cand.begin(), cand.end());  // list order, for stable tie-breaking
+            }
+            size_t ncand = narrow ? cand.size() : all.size();
 
             // rank: literal (substring) matches before fuzzy ones, then
             // nearest to the cwd (fewest path components), then tier (exact <
@@ -743,7 +771,8 @@ struct App {
                 return false;
             };
 
-            for (size_t i = 0; i < all.size(); i++) {
+            for (size_t c = 0; c < ncand; c++) {
+                size_t i = narrow ? static_cast<size_t>(cand[c]) : c;
                 int ii = static_cast<int>(i);
                 int depth = ldepth[i];
                 if (dirs_only && !all[i].is_dir) continue;
@@ -755,10 +784,10 @@ struct App {
                 Hit h{0, depth, 0, 0, 0, ii};
                 bool ok = true;
                 for (const std::string& t : terms) {
-                    int c = 0, tr = 0;
+                    int cl = 0, tr = 0;
                     size_t ex = 0, ps = 0;
-                    if (!match_term(i, t, c, tr, ex, ps)) { ok = false; break; }
-                    h.cls = std::max(h.cls, c);
+                    if (!match_term(i, t, cl, tr, ex, ps)) { ok = false; break; }
+                    h.cls = std::max(h.cls, cl);
                     h.tier = std::max(h.tier, tr);
                     h.extra += ex;
                     h.pos += ps;
@@ -779,9 +808,17 @@ struct App {
                 for (size_t j = 0; j < idx.size(); j++)
                     if (idx[j] == keep) { sel = static_cast<int>(j); break; }
 
+            prev_q = qfull;
+            prev_has_terms = !terms.empty();
+            prev_scanned = all.size();
+            prev_valid = true;
+            filter_ms = static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - f0).count());
+
             bool requery = false;
             while (!requery) {
                 draw(std::string(1, key) + q, true);
+                last_draw = std::chrono::steady_clock::now();
 
                 // wait for a key; while none is pending, scan a little more
                 int k = 0;
@@ -793,14 +830,17 @@ struct App {
                         scanning = !w.done();
                         sync();
                         auto nowt = std::chrono::steady_clock::now();
-                        bool due = nowt - last_req >= std::chrono::milliseconds(150);
-                        // re-filter at most every 150 ms (or when the scan ends);
-                        // otherwise just redraw so the counter keeps moving
+                        // re-filter at most every 150 ms (longer if filtering is
+                        // slow), or when the scan ends; otherwise just redraw
+                        // (at most ~30 fps) so the counter keeps moving
+                        bool due = nowt - last_req >=
+                                   std::chrono::milliseconds(std::max<long>(150, filter_ms * 8));
                         if (!lq.empty() && (!scanning || (all.size() != before && due))) {
                             requery = from_walk = true;
                             last_req = nowt;
-                        } else {
+                        } else if (!scanning || nowt - last_draw >= std::chrono::milliseconds(33)) {
                             draw(std::string(1, key) + q, true);
+                            last_draw = nowt;
                         }
                     } else {
                         k = read_key();
