@@ -13,7 +13,7 @@
 #   CD:<path>     directory the UI ended in (we cd there)
 #   EDIT:<path>   open this file in $ZSHEX_EDITOR, then relaunch the UI
 
-: ${ZSHEX_BIN:=$HOME/.local/share/zshex/zshex-bin}
+: ${ZSHEX_BIN:=$HOME/.local/share/zshex/zshex}
 : ${ZSHEX_EDITOR:=vim}
 : ${ZSHEX_BIND:='^E'}
 
