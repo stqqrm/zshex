@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
@@ -24,6 +25,7 @@
 #include <fcntl.h>
 #include <grp.h>
 #include <pwd.h>
+#include <signal.h>
 #include <sys/stat.h>
 #include <poll.h>
 #include <sys/ioctl.h>
@@ -60,6 +62,18 @@ static void on_signal(int) {
     _exit(1);
 }
 
+// SIGWINCH: the handler does nothing; its only job is to interrupt the
+// blocking read() so the UI loop redraws with the new size.
+static void on_winch(int) {}
+
+static void install_winch() {
+    struct sigaction sa{};
+    sa.sa_handler = on_winch;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;  // no SA_RESTART: read() must return EINTR
+    sigaction(SIGWINCH, &sa, nullptr);
+}
+
 static bool term_raw() {
     tty_fd = ::open("/dev/tty", O_RDWR);
     if (tty_fd < 0) return false;
@@ -75,6 +89,7 @@ static bool term_raw() {
     std::signal(SIGTERM, on_signal);
     std::signal(SIGHUP, on_signal);
     std::signal(SIGPIPE, SIG_IGN);
+    install_winch();
     tty_write("\x1b[?1049h\x1b[?25l\x1b[?7l");  // alt screen, hide cursor, no wrap
     return true;
 }
@@ -89,7 +104,7 @@ static int term_rows() {
 
 enum Key {
     K_EOF = -2, K_ESC = 1000, K_UP, K_DOWN, K_LEFT, K_RIGHT,
-    K_PGUP, K_PGDN, K_HOME, K_END
+    K_PGUP, K_PGDN, K_HOME, K_END, K_RESIZE = 1200
 };
 
 static bool wait_byte(int ms) {
@@ -99,7 +114,9 @@ static bool wait_byte(int ms) {
 
 static int read_key() {
     unsigned char c;
-    if (::read(tty_fd, &c, 1) != 1) return K_EOF;
+    ssize_t r = ::read(tty_fd, &c, 1);
+    if (r < 0 && errno == EINTR) return K_RESIZE;  // terminal was resized
+    if (r != 1) return K_EOF;
     if (c != 0x1b) return c;
 
     // Esc: bare Esc, or the start of an escape sequence
@@ -123,6 +140,10 @@ static int read_key() {
     if (seq == "6~") return K_PGDN;
     if (seq == "H" || seq == "1~" || seq == "7~") return K_HOME;
     if (seq == "F" || seq == "4~" || seq == "8~") return K_END;
+    // Ctrl-I as sent by terminals / configs that distinguish it from Tab:
+    //   CSI u form:            ESC [ 105 ; 5 u
+    //   modifyOtherKeys form:  ESC [ 27 ; 5 ; 105 ~
+    if (seq == "105;5u" || seq == "27;5;105~") return '\t';
     return K_ESC + 100;  // unknown sequence: ignored
 }
 
@@ -164,6 +185,20 @@ static bool fuzzy_span(const std::string& c, const std::string& q, size_t& s, si
     }
     s = j;
     return true;
+}
+
+// Split a query into whitespace-separated terms.
+static std::vector<std::string> split_terms(const std::string& q) {
+    std::vector<std::string> t;
+    size_t i = 0;
+    while (i < q.size()) {
+        while (i < q.size() && std::isspace(static_cast<unsigned char>(q[i]))) i++;
+        size_t j = i;
+        while (j < q.size() && !std::isspace(static_cast<unsigned char>(q[j]))) j++;
+        if (j > i) t.push_back(q.substr(i, j - i));
+        i = j;
+    }
+    return t;
 }
 
 static std::string perm_string(mode_t m) {
@@ -461,15 +496,22 @@ struct App {
         sel = std::clamp(sel + d, 0, static_cast<int>(idx.size()) - 1);
     }
 
-    // n / N: jump to next / previous fuzzy match in the full list
+    // n / N: jump to next / previous match in the full list. The query is
+    // split on whitespace and every word must match (fuzzy), in any order.
     void next_match(int step) {
         if (last_query.empty() || all.empty()) return;
-        std::string q = lower(last_query);
+        std::vector<std::string> terms = split_terms(lower(last_query));
+        if (terms.empty()) return;
         int n = static_cast<int>(all.size());
         for (int i = 1; i <= n; i++) {
             int k = ((sel + step * i) % n + n) % n;
-            size_t s, e;
-            if (fuzzy_span(lower(all[k].name), q, s, e)) { sel = k; return; }
+            std::string nm = lower(all[k].name);
+            bool ok = true;
+            for (const std::string& t : terms) {
+                size_t s, e;
+                if (!fuzzy_span(nm, t, s, e)) { ok = false; break; }
+            }
+            if (ok) { sel = k; return; }
         }
     }
 
@@ -491,8 +533,13 @@ struct App {
         }
 
         std::string b = "\x1b[?25l\x1b[H\x1b[2K\x1b[91m";
-        if (searching) b += prompt;
-        else b += " zshex  " + cwd + "  [" + std::to_string(n ? sel + 1 : 0) + "/" + std::to_string(n) + "]";
+        if (searching) {
+            b += prompt;
+            // live counter: matches shown / entries scanned so far
+            b += "\x1b[90m  (" + std::to_string(n) + "/" + std::to_string(all.size()) + ")\x1b[91m";
+        } else {
+            b += " zshex  " + cwd + "  [" + std::to_string(n ? sel + 1 : 0) + "/" + std::to_string(n) + "]";
+        }
         b += "\x1b[0m\r\n";
 
         // recursive search: stat only the visible rows, size columns to them
@@ -567,12 +614,11 @@ struct App {
     };
 
     // Reads whole directories until `budget_ms` has passed (always at least
-    // one directory) or the walk is finished. Appends to `out`.
+    // one directory) or the walk is finished. Appends to `out`. There is no
+    // entry limit: the walk runs until the whole tree has been read.
     static void walk_step(Walker& w, std::vector<Entry>& out, int budget_ms) {
-        const size_t kMax = 30000;
         auto t0 = std::chrono::steady_clock::now();
         while (!w.done()) {
-            if (out.size() >= kMax) { w.next = w.dirs.size(); break; }
             const std::string dir = w.dirs[w.next++];
             if (DIR* d = opendir(dir.empty() ? "." : dir.c_str())) {
                 while (dirent* de = readdir(d)) {
@@ -642,6 +688,7 @@ struct App {
         std::string q;
         int s0 = sel, t0 = top;
         bool moved = false, from_walk = false;
+        auto last_req = std::chrono::steady_clock::now();
         while (true) {
             // when the list is only being refreshed because the scan found
             // more entries, keep the selection if the user has moved it
@@ -653,8 +700,9 @@ struct App {
             // directory names is just a marker, it is not part of the name)
             bool dirs_only = !lq.empty() && lq.back() == '/';
             if (dirs_only) lq.pop_back();
-            // a "/" inside the query matches against the whole relative path
-            bool by_path = lq.find('/') != std::string::npos;
+            // whitespace-separated terms: every term must match, in any order
+            std::vector<std::string> terms = split_terms(lq);
+
             // rank: literal (substring) matches before fuzzy ones, then
             // nearest to the cwd (fewest path components), then tier (exact <
             // prefix < substring of name < substring of path < fuzzy name <
@@ -662,35 +710,60 @@ struct App {
             // position, then list order
             struct Hit { int cls, depth, tier; size_t extra, pos; int i; };
             std::vector<Hit> hits;
+
+            // match one term against entry i; a "/" inside a term matches
+            // against the whole relative path
+            auto match_term = [&](size_t i, const std::string& t,
+                                  int& cls, int& tier, size_t& extra, size_t& pos) -> bool {
+                bool bp = t.find('/') != std::string::npos;
+                const std::string& b = bp ? lpath[i] : lbase[i];
+                size_t p = b.find(t);
+                if (p != std::string::npos) {
+                    cls = 0; tier = b == t ? 0 : p == 0 ? 1 : 2;
+                    extra = b.size() - t.size(); pos = p;
+                    return true;
+                }
+                // substring somewhere else in the path (e.g. a directory name)
+                if (!bp) {
+                    size_t pp = lpath[i].find(t);
+                    if (pp != std::string::npos) {
+                        cls = 0; tier = 3; extra = lpath[i].size() - t.size(); pos = pp;
+                        return true;
+                    }
+                }
+                size_t s, e;
+                if (fuzzy_span(b, t, s, e)) {
+                    cls = 1; tier = 4; extra = (e - s + 1) - t.size(); pos = s;
+                    return true;
+                }
+                if (fuzzy_span(lpath[i], t, s, e)) {
+                    cls = 1; tier = 5; extra = (e - s + 1) - t.size(); pos = s;
+                    return true;
+                }
+                return false;
+            };
+
             for (size_t i = 0; i < all.size(); i++) {
                 int ii = static_cast<int>(i);
                 int depth = ldepth[i];
                 if (dirs_only && !all[i].is_dir) continue;
-                if (lq.empty()) {
+                if (terms.empty()) {
                     // empty query: just the current directory's entries
                     if (depth == 0) hits.push_back({0, 0, 0, 0, 0, ii});
                     continue;
                 }
-                const std::string& b = by_path ? lpath[i] : lbase[i];
-                size_t pos = b.find(lq);
-                if (pos != std::string::npos) {
-                    int tier = b == lq ? 0 : pos == 0 ? 1 : 2;
-                    hits.push_back({0, depth, tier, b.size() - lq.size(), pos, ii});
-                    continue;
+                Hit h{0, depth, 0, 0, 0, ii};
+                bool ok = true;
+                for (const std::string& t : terms) {
+                    int c = 0, tr = 0;
+                    size_t ex = 0, ps = 0;
+                    if (!match_term(i, t, c, tr, ex, ps)) { ok = false; break; }
+                    h.cls = std::max(h.cls, c);
+                    h.tier = std::max(h.tier, tr);
+                    h.extra += ex;
+                    h.pos += ps;
                 }
-                // substring somewhere else in the path (e.g. a directory name)
-                if (!by_path) {
-                    size_t pp = lpath[i].find(lq);
-                    if (pp != std::string::npos) {
-                        hits.push_back({0, depth, 3, lpath[i].size() - lq.size(), pp, ii});
-                        continue;
-                    }
-                }
-                size_t s, e;
-                if (fuzzy_span(b, lq, s, e))
-                    hits.push_back({1, depth, 4, (e - s + 1) - lq.size(), s, ii});
-                else if (fuzzy_span(lpath[i], lq, s, e))
-                    hits.push_back({1, depth, 5, (e - s + 1) - lq.size(), s, ii});
+                if (ok) hits.push_back(h);
             }
             std::stable_sort(hits.begin(), hits.end(), [](const Hit& x, const Hit& y) {
                 if (x.cls != y.cls) return x.cls < y.cls;
@@ -719,8 +792,16 @@ struct App {
                         walk_step(w, all, 8);
                         scanning = !w.done();
                         sync();
-                        if (!lq.empty() && (all.size() != before || !scanning)) requery = from_walk = true;
-                        else if (!scanning) draw(std::string(1, key) + q, true);  // drop the "scanning" note
+                        auto nowt = std::chrono::steady_clock::now();
+                        bool due = nowt - last_req >= std::chrono::milliseconds(150);
+                        // re-filter at most every 150 ms (or when the scan ends);
+                        // otherwise just redraw so the counter keeps moving
+                        if (!lq.empty() && (!scanning || (all.size() != before && due))) {
+                            requery = from_walk = true;
+                            last_req = nowt;
+                        } else {
+                            draw(std::string(1, key) + q, true);
+                        }
                     } else {
                         k = read_key();
                         have_key = true;
@@ -728,7 +809,7 @@ struct App {
                 }
                 if (requery) break;
 
-                if (k == K_EOF || k == K_ESC) { finish(); sel = s0; top = t0; return false; }
+                if (k == K_EOF || k == K_ESC || k == 0x03) { finish(); sel = s0; top = t0; return false; }
                 if (k == '\n' || k == '\r') {
                     if (idx.empty()) { finish(); sel = s0; top = t0; return false; }
                     picked = all[idx[sel]].name;
@@ -752,6 +833,7 @@ struct App {
                         break;
                     case 0x15: q.clear(); requery = true; moved = false; break;
                     default:
+                        // K_RESIZE and other ignored keys fall through to the redraw
                         if ((k >= 32 && k < 127) || (k >= 128 && k < 256)) {
                             q += static_cast<char>(k);
                             requery = true;
@@ -770,7 +852,7 @@ struct App {
             draw("", false);
             int k = read_key();
             switch (k) {
-                case K_EOF: case 'q': case K_ESC: return;  // q, Esc
+                case K_EOF: case 'q': case K_ESC: case 0x03: return;  // q, Esc, Ctrl-C
                 case 'j': case K_DOWN: move(1); break;
                 case 'k': case K_UP: move(-1); break;
                 case K_PGDN: move(win); break;
@@ -784,7 +866,7 @@ struct App {
                     break;
                 }
                 case 0x0f: hist(true); break;    // Ctrl-O
-                case '\t': hist(false); break;   // Ctrl-I
+                case '\t': hist(false); break;   // Ctrl-I / Tab
                 case '~': { const char* h = std::getenv("HOME"); if (h) change_dir(h); break; }
                 case '-': case 'h': case K_LEFT: case 0x7f: case 0x08: go_up(); break;
                 case 'l': case K_RIGHT: case '\n': case '\r': enter(); break;
