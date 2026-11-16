@@ -1,19 +1,24 @@
-# zshex.zsh - zsh wrapper for the zshex C++ binary (Ctrl-E)
+# zshex.zsh - zsh wrapper for the zshex C++ binary
 #
 # Set before sourcing (in ~/.zshrc):
 #   export ZSHEX_BIN=~/repository/zshex/zshex     # path to the binary
 #   export ZSHEX_EDITOR=vim                       # editor command (default: vim)
+#   export ZSHEX_BIND='^E'                        # key that opens (and closes) the UI
 #   source /path/to/zshex.zsh
+#
+# ZSHEX_BIND is read when this file is sourced. ZSHEX_EDITOR is read every
+# time a file is opened, so it can be changed later.
 #
 # Protocol (binary stdout -> temp file):
 #   CD:<path>     directory the UI ended in (we cd there)
 #   EDIT:<path>   open this file in $ZSHEX_EDITOR, then relaunch the UI
 
-: ${ZSHEX_BIN:=zshex-bin}
+: ${ZSHEX_BIN:=$HOME/.local/share/zshex/zshex-bin}
 : ${ZSHEX_EDITOR:=vim}
+: ${ZSHEX_BIND:='^E'}
 
 zshex-update() {
-  local url=https://raw.githubusercontent.com/stqqrm/zshex/main/zshex.cpp
+  local url=https://raw.githubusercontent.com/stqqrm/zshex/refs/heads/main/src/zshex.cpp
   local bin=${~ZSHEX_BIN} src hash
   mkdir -p ${bin:h} || return
 
@@ -47,6 +52,19 @@ _zshex_edit() {
   fi
 }
 
+# Translate a zsh key notation like ^E into the control byte the binary
+# receives. Prints 0 (no close key) for anything that isn't a single Ctrl key.
+_zshex_close_key() {
+  local b=$1 c
+  if [[ $b == '^?' ]]; then print 127; return; fi
+  if [[ $b == '^'[A-Za-z@\[\\\]^_] ]]; then
+    c=${(U)b[2]}
+    print $(( #c & 31 ))
+  else
+    print 0
+  fi
+}
+
 zshex-widget() {
   local bin=${~ZSHEX_BIN}
   if [[ $bin == */* ]]; then
@@ -56,12 +74,13 @@ zshex-widget() {
   fi
 
   local tmp state line dir file pick rc
+  local ck=$(_zshex_close_key $ZSHEX_BIND)
   tmp=$(mktemp) || return
   state=$(mktemp) || { command rm -f -- $tmp; return }
 
   zle -I
   while true; do
-    local -a args=(--state $state)
+    local -a args=(--state $state --close-key $ck)
     [[ -n $pick ]] && args+=(--select $pick)
     pick=
 
@@ -92,6 +111,6 @@ zshex-widget() {
 }
 
 zle -N zshex-widget
-bindkey '^e' zshex-widget
-bindkey -M viins '^e' zshex-widget 2>/dev/null
-bindkey -M vicmd '^e' zshex-widget 2>/dev/null
+bindkey "$ZSHEX_BIND" zshex-widget
+bindkey -M viins "$ZSHEX_BIND" zshex-widget 2>/dev/null
+bindkey -M vicmd "$ZSHEX_BIND" zshex-widget 2>/dev/null
